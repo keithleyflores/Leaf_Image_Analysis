@@ -1,0 +1,218 @@
+---
+title: "Characterizing Swedish Tree Leaves from Outline, Color, and Vein Features"
+author: "Keithley Flores — STA 160 Final Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5)
+library(tidyverse); library(patchwork); library(knitr)
+
+feat <- readr::read_csv("output/features.csv", show_col_types = FALSE) |>
+  mutate(species = factor(species), species_name = factor(species_name))
+```
+
+# Introduction
+
+This report studies leaves from the Swedish Leaf Dataset (Söderkvist, 2001),
+which contains 15 tree species with 75 scanned images each. We analyze
+`r nlevels(feat$species_name)` species
+(`r paste(levels(feat$species_name), collapse = ", ")`),
+for a total of `r nrow(feat)` images.
+
+We characterize each species along three complementary axes that Söderkvist
+(2001) identifies as the main families of leaf features: the outline
+(shape of the blade), the color of the leaf surface, and the inner
+structure captured by the veins. The central question is not merely
+"can we predict the species" but "what, precisely, distinguishes one species
+from another, and where does each feature family succeed or fail."
+
+We chose five species that span the range of blade shapes in the dataset while deliberately including two long-petiole species, Acer platanoides and Populus tremula, so that the petiole-handling step can be demonstrated and validated. The remaining three: Quercus robur, Ulmus carpinifolia, and a second Populus, give a useful contrast in elongation and lobing: the two elongated species (Quercus, Ulmus) sit at one end of the aspect-ratio range and the rounded maples and aspens at the other, which lets us show both where outline features cleanly separate species and where they collapse together.
+
+# Data and Preprocessing
+
+Each color image is converted to grayscale, thresholded (leaf = dark region,
+grayscale $\le 200/255$), reduced to its largest connected component, and
+hole-filled. The leaf outline is the 8-neighbourhood boundary of this mask.
+All feature extraction code is in the accompanying `R/` scripts and is
+embedded by reference here (rubric [b]: code is submitted).
+
+```{r preprocessing-demo, eval=FALSE}
+# Illustrative: preprocess a single leaf and show the pipeline stages.
+.r_dir <- if (dir.exists("R")) "R" else "../R"
+source("config.R"); source("01_preprocess.R")
+p <- preprocess_leaf(file.path(DATA_DIR, "leaf1", "l1nr001.tif"))
+par(mfrow = c(1, 3), mar = c(1,1,2,1))
+image(t(p$gray[nrow(p$gray):1, ]), col = gray.colors(256), axes = FALSE, main = "grayscale")
+image(t(p$mask[nrow(p$mask):1, ]), col = c("white","black"), axes = FALSE, main = "binary mask")
+image(t(p$edge[nrow(p$edge):1, ]), col = c("white","black"), axes = FALSE, main = "outline")
+```
+
+Across these five species the fixed threshold at 200/255 separates leaf from background reliably, because the Swedish scans place a dark leaf on a light, fairly uniform background — the grayscale histogram is strongly bimodal, so the exact cut point is not delicate. The largest-connected-component and hole-filling steps clean up the few failure modes that remain: specular highlights on glossy blades and small gaps where a vein or the petiole tip is nearly background-colored. The step is least comfortable on the long-petiole species (Acer, Populus tremula), where the thin stalk is low-contrast and can be partially lost or, conversely, joined to a shadow; this does not corrupt the blade mask but is the motivation for treating the petiole explicitly in §3.1 rather than trusting the raw outline.
+
+# Outline Features
+
+We compute the shape descriptors suggested in the Week 6 discussion plus
+several standard additions: area, perimeter, circularity
+($\text{perimeter}^2/\text{area}$), compactness, eccentricity, major/minor
+axis length, aspect (length/width) ratio, rectangularity, solidity (area /
+convex-hull area), equivalent diameter, the seven Hu invariant moments, and a
+left/right asymmetry index measured about the principal axis (a proxy for
+the main vein).
+
+```{r outline-summary}
+outline_vars <- c("area", "perimeter", "circularity", "compactness",
+                  "eccentricity", "aspect_ratio_blade", "rectangularity",
+                  "solidity", "asymmetry_index")
+feat |>
+  group_by(species_name) |>
+  summarise(across(all_of(outline_vars), mean), .groups = "drop") |>
+  kable(digits = 3, caption = "Mean outline features by species.")
+```
+
+```{r outline-dists, fig.height=7, fig.cap="Distribution and ECDF of blade aspect ratio across species."}
+p_hist <- ggplot(feat, aes(aspect_ratio_blade, fill = species_name)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  facet_wrap(~ species_name, ncol = 1, strip.position = "right") +
+  labs(x = "aspect ratio (blade)", y = "count") +
+  theme_minimal() + theme(legend.position = "none")
+p_ecdf <- ggplot(feat, aes(aspect_ratio_blade, color = species_name)) +
+  stat_ecdf(linewidth = 0.8) +
+  labs(x = "aspect ratio (blade)", y = "F(x)", color = "species") +
+  theme_minimal()
+p_hist | p_ecdf
+```
+
+Read off Figure 1, the elongated species are tightly and well separated from the rounded ones: Quercus robur (mean blade aspect 1.77) and Ulmus carpinifolia (1.69) form a clear high-aspect cluster, while Populus tremula (1.08), Acer platanoides (1.12), and the second Populus (1.19) pile up near 1.1. The ECDF makes the gap explicit. The Quercus and Ulmus curves rise almost entirely above 1.4, whereas the three rounded species have risen to F(x) ≈ 1 before 1.4. The poor separations are within each cluster: Acer and Populus tremula overlap almost completely on this axis, and Quercus and Ulmus overlap heavily with each other. So aspect ratio characterizes "elongated vs. rounded" well but cannot, on its own, tell the two elongated species apart or the rounded ones apart.
+
+## Handling long petioles
+
+The course clarification notes that species such as *Acer platanoides* (2) and
+*Populus tremula* (8) have long petioles that inflate the length/width ratio.
+We detect the petiole as a thin protrusion (morphological erosion removes the
+thin stalk but keeps the blade) and recompute the aspect ratio on the blade
+alone. The figure contrasts the two.
+
+```{r petiole, fig.cap="Aspect ratio with vs. without the petiole."}
+feat |>
+  select(species_name, aspect_ratio_raw, aspect_ratio_blade) |>
+  pivot_longer(-species_name, names_to = "type", values_to = "aspect") |>
+  mutate(type = recode(type, aspect_ratio_raw = "with petiole",
+                              aspect_ratio_blade = "blade only")) |>
+  ggplot(aes(species_name, aspect, fill = type)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) + coord_flip() +
+  labs(x = NULL, y = "aspect ratio", fill = NULL) + theme_minimal()
+```
+
+The two long-petiole species show exactly the inflation the trimming step is meant to remove. For Populus tremula the median aspect ratio drops from roughly 1.6 with the petiole to about 1.08 on the blade alone. The raw measurement nearly doubles the apparent elongation, and the with-petiole distribution is far wider and right-skewed because petiole length varies leaf to leaf. Acer platanoides shifts similarly, from a median near 1.0–1.5 (with a long left whisker from leaves whose stalk fell along the minor axis) down to a tight cluster around 1.12 once trimmed. The blade-only measurement is the fairer cross-species descriptor precisely because the petiole is an appendage whose length depends on how the leaf was cut and mounted, not on blade shape; leaving it in would let mounting artefacts masquerade as morphological differences and would, for instance, push Populus tremula's raw aspect ratio up into the Quercus/Ulmus range despite its blade being nearly round.
+
+## What the outline can and cannot characterize
+
+
+```{r asym, fig.cap="Left/right asymmetry about the principal axis.", fig.height=4}
+ggplot(feat, aes(species_name, asymmetry_index, fill = species_name)) +
+  geom_boxplot(alpha = 0.7) + coord_flip() +
+  labs(x = NULL, y = "asymmetry index") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+**Can:** Outline features cleanly separate species whose blades differ in
+gross shape (e.g., narrow vs. round, lobed vs. entire, symmetric vs. skewed).
+Circularity and aspect ratio capture elongation; solidity captures lobing and
+serration (a deeply lobed oak has lower solidity than a smooth-margined blade);
+the asymmetry index captures species whose blade is uneven about the principal
+axis, though in our five species this turns out to be a weak discriminator (see
+below).
+
+**Cannot:** Outline alone confuses species with similar silhouettes but
+different surface or venation. It is sensitive to petioles (handled above), to
+leaves built from multiple leaflets (a compound *Sorbus* leaf may fragment or
+read as multiple blobs), and to scanning artefacts (overlap, folding). It
+carries no information about color or vein pattern.
+
+A pair the outline separates cleanly is Quercus robur vs. Acer platanoides: they differ in gross shape on multiple axes at once, aspect ratio (1.77 vs. 1.12), solidity (0.82 vs. 0.52), and eccentricity (0.86 vs. 0.43), so the Quercus blade is both more elongated and more deeply indented, and the ECDFs of any one of these features barely overlap. A pair it confuses is Quercus robur vs. Ulmus carpinifolia: their blade aspect ratios (1.77 vs. 1.69) overlap almost entirely in Figure 1, and although solidity separates them somewhat (0.82 vs. 0.94), their silhouettes are similar enough that outline features alone leave real ambiguity. The asymmetry index behaves as expected for the lobed/skewed claim. Ulmus has the lowest mean asymmetry (0.007), consistent with its characteristically uneven base being modest about the principal axis here, while Acer and Populus sit higher (0.019–0.026),but the spread in Figure 3 is wide enough that asymmetry is a weak discriminator on its own.
+
+# Color Features
+
+**Why:** Two species can share a silhouette yet differ in pigmentation,
+glossiness, or how color varies from tip to base. Color adds a dimension the
+outline cannot see. **How:** over the leaf pixels only, we summarize three
+color systems: RGB (raw), HSV (perceptually intuitive: hue/saturation/value),
+and CIELAB (perceptually uniform lightness/color), plus brightness-robust
+greenness (excess green, green fraction), the proportion of greener/yellower/
+darker pixels, within-leaf color uniformity (CV of hue and value), and mean
+greenness by region (center/edge/tip/base).
+
+```{r color, fig.cap="Mean hue and mean green fraction by species."}
+(ggplot(feat, aes(species_name, H_mean, fill = species_name)) +
+   geom_boxplot(alpha = 0.7) + coord_flip() +
+   labs(x = NULL, y = "mean hue (0-1)") +
+   theme_minimal() + theme(legend.position = "none")) |
+(ggplot(feat, aes(species_name, green_frac_mean, fill = species_name)) +
+   geom_boxplot(alpha = 0.7) + coord_flip() +
+   labs(x = NULL, y = "mean green fraction") +
+   theme_minimal() + theme(legend.position = "none"))
+```
+
+```{r color-uniformity, fig.cap="Within-leaf color variation (hue CV) by species.", fig.height=4}
+ggplot(feat, aes(species_name, hue_cv, fill = species_name)) +
+  geom_boxplot(alpha = 0.7) + coord_flip() +
+  labs(x = NULL, y = "hue coefficient of variation") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+Color adds separation where the outline failed. The clearest case is Quercus robur vs. Ulmus carpinifolia. Nearly inseparable by aspect ratio, which split on mean hue: Ulmus sits at the high end of the hue range (≈0.165) while Quercus is lower (≈0.15), and their mean-green-fraction boxes in Figure 4 barely overlap. Acer and Populus tremula, the rounded pair the outline also confused, separate on green fraction as well. Color is not uniform within a leaf: the hue coefficient of variation in Figure 5 is substantial for every species (medians ≈0.13–0.18) and largest for Populus tremula, indicating real tip-to-base and center-to-edge variation rather than a flat color field. Following Söderkvist (2001), we treat color as a supporting feature only: hue and greenness depend on season, lighting, scanner, and leaf age, so the absolute values are not stable across datasets even where they separate species cleanly within this one. Color earns its place by breaking ties the outline cannot, not as a standalone discriminator.
+
+# Vein (Inner-Structure) Features
+
+Following Zheng & Wang (2010), we extract veins by gray-scale morphology: a
+multi-scale top-hat highlights thin structures that differ in intensity from
+the smooth blade; we threshold the response inside the leaf interior, skeletonize,
+and measure vein density and vein length per unit area.
+
+```{r veins, fig.cap="Vein length per unit leaf area by species.", fig.height=4}
+ggplot(feat, aes(species_name, vein_len_per_area, fill = species_name)) +
+  geom_boxplot(alpha = 0.7) + coord_flip() +
+  labs(x = NULL, y = "skeleton px / leaf px") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+Vein length per unit area does add separation beyond outline and color, and notably for the hardest pair. Ulmus carpinifolia has the densest veins (≈0.10 skeleton px per leaf px) and Quercus robur is lower (≈0.088), so vein density separates the two elongated species that overlap on aspect ratio, a genuinely new axis. Populus tremula and the second Populus sit in the middle (≈0.075–0.079) and Acer lowest, so the feature orders the species sensibly. The caveat is that vein extraction is the most fragile step in the pipeline: the top-hat response depends on scan resolution and on the contrast between vein and blade, both of which vary with the 512-px downsizing and with leaf condition, so the absolute densities should be read as relative orderings rather than physical measurements.
+
+# Conclusion
+
+Per species, the most precise characterization is: Quercus robur, high aspect ratio (1.77) and high solidity, distinguished from the similarly elongated Ulmus by lower vein density and lower hue; Ulmus carpinifolia, elongated like Quercus but set apart by the highest solidity (0.94), highest hue, and densest veins; Acer platanoide, a rounded blade (aspect 1.12) identifiable only after petiole trimming, separated from the equally round Populus tremula by green fraction; Populus tremula, the roundest blade (1.08) once the long petiole is removed, with the most within-leaf color variation; and the second Populus, intermediate on every axis, the hardest of the five to pin down with any single feature. The broader lesson is that outline alone is sufficient only for gross shape contrasts (elongated vs. rounded) and is actively misleading on the long-petiole species until the stalk is removed; color resolves several ties the outline leaves, and veins resolve the Quercus/Ulmus pair that survives both. No single feature family characterizes all five, the precise description of each species comes from the combination, with each family covering the others' blind spots.
+
+# References
+
+Söderkvist, O. (2001). *Computer Vision Classification of Leaves from Swedish
+Trees.* Master's thesis, Linköping University.
+
+Zheng, X., & Wang, X. (2010). Leaf Vein Extraction Based on Gray-Scale
+Morphology. *International Journal of Image, Graphics and Signal Processing*,
+2(2), 25.
+
+# Code and Data Availability
+
+All code used to produce this report, the preprocessing and feature-extraction
+scripts (`config.R`, `01_preprocess.R` through `05_run_all.R`), the
+exploratory-analysis script (`06_eda_and_compare.R`), the pipeline-run notebook
+(`00_run_pipeline.Rmd`), and this report source (`final_report.Rmd`), is
+available at:
+
+> **GitHub repository:** <https://github.com/keithleyflores/Leaf_Image_Analysis>
+
+The Swedish Leaf Dataset is not redistributed here; it is available from
+Söderkvist (2001). To reproduce the results, place the dataset under the path
+set in `DATA_DIR` (see `config.R`), run `00_run_pipeline.Rmd` to regenerate
+`output/features.csv`, then knit `final_report.Rmd`.

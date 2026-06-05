@@ -1,0 +1,163 @@
+---
+title: "Pipeline Run & Data Check"
+author: "Keithley Flores — STA 160 Final Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+# Purpose
+
+This notebook is **not** the report. It is the one-time (well, run-it-whenever-
+the-data-changes) setup step that:
+
+1. sources `config.R` and the feature scripts `01`–`04`,
+2. runs the full extraction loop over all selected species (`05_run_all.R`),
+3. writes `output/features.csv`, and
+4. sanity-checks that the CSV really contains all the species you expect.
+
+Knit or run this first. **Only after** `output/features.csv` shows ~375 rows
+across 5 species should you knit `final_report.Rmd` — that report just reads
+the CSV this notebook produces.
+
+> Why separate files? The report was rendering "1 species / 2 images" because
+> a stale 2-row `features.csv` was sitting in `output/` from an earlier
+> single-leaf test. Keeping the *run* (this file) apart from the *report*
+> makes it obvious whether the data has actually been regenerated.
+
+# Locate the project scripts
+
+Set this to the folder that holds `config.R` and the numbered scripts. The
+chunk also confirms each file is present before sourcing anything.
+
+```{r script-dir}
+R_DIR <- if (dir.exists("R")) "R" else "."
+
+needed <- c("config.R", "01_preprocess.R", "02_outline_features.R",
+            "03_color_features.R", "04_vein_features.R", "05_run_all.R")
+present <- file.exists(file.path(R_DIR, needed))
+stopifnot("Some scripts are missing from R_DIR — fix R_DIR above." = all(present))
+data.frame(script = needed, found = present)
+```
+
+# Clear the stale cache
+
+Remove any old `output/features.csv` so there is no chance of knitting the
+report against leftover data. (A warning here just means it was already gone.)
+
+```{r clear-cache}
+old <- file.path("output", "features.csv")
+if (file.exists(old)) {
+  file.remove(old)
+  message("Removed stale ", old)
+} else {
+  message("No existing features.csv — nothing to clear.")
+}
+```
+
+# Source config and confirm the data path
+
+`config.R` defines `DATA_DIR`, `SPECIES_IDS`, the file-name templates, etc.
+The check below must print `TRUE` for every species before the slow loop —
+this is where a wrong `DATA_DIR` (e.g. a Windows `C:/...` path on a Mac) shows
+up immediately instead of 6 minutes into the run.
+
+```{r source-config}
+source(file.path(R_DIR, "config.R"))
+
+# DATA_DIR sanity: does the dataset directory exist, and is the first image
+# of each requested species reachable?
+stopifnot("DATA_DIR does not exist — fix it in config.R" = dir.exists(DATA_DIR))
+
+first_images <- vapply(SPECIES_IDS, function(id) {
+  folder <- gsub("\\{id\\}", id, FOLDER_TEMPLATE)
+  fname  <- gsub("\\{n\\}", sprintf("%03d", 1),
+                 gsub("\\{id\\}", id, FILE_TEMPLATE))
+  file.exists(file.path(DATA_DIR, folder, fname))
+}, logical(1))
+
+data.frame(species_id = SPECIES_IDS,
+           species_name = unname(SPECIES_NAMES[as.character(SPECIES_IDS)]),
+           first_image_found = first_images)
+```
+
+```{r stop-if-missing}
+stopifnot(
+  "At least one species' first image was not found — check DATA_DIR and the FILE/FOLDER templates in config.R." =
+    all(first_images)
+)
+message("All ", length(SPECIES_IDS), " species reachable. OK to run the loop.")
+```
+
+# Source the feature scripts
+
+These only *define* functions (`preprocess_leaf`, `outline_features`,
+`color_features`, `vein_features`). Sourcing them should print package startup
+messages but should not process any images.
+
+```{r source-features}
+source(file.path(R_DIR, "01_preprocess.R"))
+source(file.path(R_DIR, "02_outline_features.R"))
+source(file.path(R_DIR, "03_color_features.R"))
+source(file.path(R_DIR, "04_vein_features.R"))
+```
+
+# Run the full extraction loop
+
+This is the slow step (a few minutes for 5 species at 512px). `05_run_all.R`
+runs `run_all()` at the bottom, which writes `output/features.csv` and returns
+the data frame as `features`.
+
+```{r run-all}
+source(file.path(R_DIR, "05_run_all.R"))
+```
+
+# Sanity-check the result
+
+The whole point of this notebook: confirm the CSV has many rows across all
+species, not 2 rows of one species.
+
+```{r check-csv}
+f <- readr::read_csv(file.path("output", "features.csv"), show_col_types = FALSE)
+
+cat("Total rows:", nrow(f), "\n")
+cat("Distinct species:", length(unique(f$species_name)), "\n\n")
+print(table(f$species_name))
+```
+
+```{r assert-multispecies}
+stopifnot(
+  "features.csv still has too few rows — the loop did not process the full set." =
+    nrow(f) >= 0.5 * length(SPECIES_IDS) * N_PER_SPECIES,
+  "features.csv has fewer species than requested in SPECIES_IDS." =
+    length(unique(f$species_name)) >= length(SPECIES_IDS)
+)
+message("features.csv looks good — you can now knit final_report.Rmd.")
+```
+
+# Optional: visual check of one leaf
+
+Confirm the threshold cleanly separates leaf from background, and that the
+leaf is not rendered mirrored/rotated. Useful for the "threshold quality"
+fill-in in the report. Change `id`/`n` to spot-check other species.
+
+```{r visual-check, fig.width=9, fig.height=3.5}
+id <- SPECIES_IDS[1]; n <- 1
+folder <- gsub("\\{id\\}", id, FOLDER_TEMPLATE)
+fname  <- gsub("\\{n\\}", sprintf("%03d", n),
+               gsub("\\{id\\}", id, FILE_TEMPLATE))
+p <- preprocess_leaf(file.path(DATA_DIR, folder, fname))
+
+par(mfrow = c(1, 3), mar = c(1, 1, 2, 1))
+image(t(p$gray[nrow(p$gray):1, ]), col = gray.colors(256), axes = FALSE, main = "grayscale")
+image(t(p$mask[nrow(p$mask):1, ]), col = c("white", "black"), axes = FALSE, main = "binary mask")
+image(t(p$edge[nrow(p$edge):1, ]), col = c("white", "black"), axes = FALSE, main = "outline")
+```
+
+---
